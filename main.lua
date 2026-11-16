@@ -15,6 +15,20 @@ local PREFIX = "openwith_"
 local PLUGIN = "open-with"
 local PYTHON = os.getenv("OPEN_WITH_PYTHON") or "python3"
 
+-- Fork change (paul): seconds to wait after emitting `open --interactive`
+-- before the temporary openers are removed again.  Yazi copies the opener
+-- rules into the picker when it is shown (yazi-actor/src/mgr/open_do.rs), so
+-- removing them afterwards does not affect the open menu, but keeps the
+-- native `O` menu free of stale system-app entries.
+local CLEANUP_DELAY = tonumber(os.getenv("OPEN_WITH_CLEANUP_DELAY") or "") or 1.5
+
+-- Fork change (paul): only accept desktop ids made of safe characters.  The
+-- id ends up inside an opener `run` string, which yazi also scans for `%`
+-- placeholders; ya.quote() protects the shell, this protects the splatter.
+local function safe_id(id)
+	return id ~= "" and id:match("^[%w%._%-]+$") ~= nil
+end
+
 local DEBUG = os.getenv("OPEN_WITH_DEBUG") == "1"
 
 local function dbg(...)
@@ -220,11 +234,9 @@ local collect = ya.sync(function()
 	return { files = out }
 end)
 
--- Runs in the sync context.  It removes the previous temporary openers,
--- registers the new ones, and appends them to the rules matched above.
-local install = ya.sync(function(_, state, apps)
-	-- 1. Remove opener groups from the previous invocation.
-	dbg("install apps=" .. tostring(#(apps or {})) .. " files=" .. tostring(#state.files))
+-- Removes every temporary opener and strips its name from all open rules.
+-- Must run in the sync context.
+local function purge()
 	local old = {}
 	for name in pairs(rt.opener) do
 		if name:match("^" .. PREFIX) then
@@ -234,16 +246,34 @@ local install = ya.sync(function(_, state, apps)
 	for _, name in ipairs(old) do
 		rt.opener[name] = nil
 	end
-	dbg("removed old=" .. tostring(#old))
 
-	-- 2. Strip stale temporary names from every open rule.  The picker has no
-	--    completion callback, so this is the cleanup point for the last run.
 	for _, rule in pairs(rt.open.rules:match()) do
 		local use = strip_temp(rule.use)
 		if #use ~= #rule.use and #use > 0 then
 			rt.open.rules:update({ id = rule.id }, { use = use })
 		end
 	end
+	return #old
+end
+
+-- Fork change (paul): deferred cleanup.  `gen` guards against a second
+-- invocation started within CLEANUP_DELAY: only the newest run cleans up.
+local cleanup = ya.sync(function(self, gen)
+	if self.gen ~= gen then
+		return 0
+	end
+	local n = purge()
+	dbg("cleanup gen=" .. tostring(gen) .. " removed=" .. tostring(n))
+	return n
+end)
+
+-- Runs in the sync context.  It removes the previous temporary openers,
+-- registers the new ones, and appends them to the rules matched above.
+local install = ya.sync(function(self, state, apps)
+	-- 1.+2. Remove opener groups and stale rule entries from earlier runs.
+	dbg("install apps=" .. tostring(#(apps or {})) .. " files=" .. tostring(#state.files))
+	dbg("removed old=" .. tostring(purge()))
+	self.gen = (self.gen or 0) + 1
 
 	-- 3. Register one opener per application.  GIO does the actual launch, so
 	--    Terminal=true, flatpak apps and field codes are handled correctly.
@@ -251,7 +281,7 @@ local install = ya.sync(function(_, state, apps)
 	local names = {}
 	for _, app in ipairs(apps or {}) do
 		local id = tostring(app.id or "")
-		if id ~= "" then
+		if safe_id(id) then
 			local key = PREFIX .. id:gsub("[^%w_%-%.]", "_")
 			local desc = tostring(app.name or id):gsub("[%c]", " ")
 			if app.default then
@@ -292,7 +322,7 @@ local install = ya.sync(function(_, state, apps)
 	end
 
 	dbg("installed names=" .. tostring(#names))
-	return #names
+	return self.gen
 end)
 
 
@@ -354,13 +384,20 @@ return {
 			return notify_fallback(tostring(data.error), "warn")
 		end
 
-		local installed, install_err = pcall(install, state, data.apps or {})
+		local installed, gen = pcall(install, state, data.apps or {})
 		if not installed then
-			return notify_fallback("Cannot install openers: " .. tostring(install_err), "error")
+			return notify_fallback("Cannot install openers: " .. tostring(gen), "error")
 		end
 
 		-- The native picker is built from YAZI.opener + YAZI.open, so the
 		-- openers installed above show up here together with edit/reveal/etc.
 		ya.emit("open", { interactive = true })
+
+		-- Fork change (paul): remove the temporary entries once the picker
+		-- has captured them, so the native `O` menu stays untouched.
+		if CLEANUP_DELAY > 0 then
+			ya.sleep(CLEANUP_DELAY)
+			pcall(cleanup, gen)
+		end
 	end,
 }

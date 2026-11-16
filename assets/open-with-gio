@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 
@@ -229,6 +230,12 @@ def launch(app_id: str, paths: list[str]) -> None:
     if launched is False:
         raise HelperError(f"GIO rejected the launch request for {app_id}")
 
+    # Fork change (paul): opt-in only.  set_as_last_used_for_type() writes to
+    # ~/.config/mimeapps.list ([Added Associations]).  For MIME types without
+    # an explicit [Default Applications] entry this silently changes what
+    # xdg-open launches system-wide.  Enable with OPEN_WITH_REMEMBER=1.
+    if os.environ.get("OPEN_WITH_REMEMBER") != "1":
+        return
     # Let GIO's "recently used" ordering work like Nautilus.  Failure here is
     # harmless, so never let it break the launch.
     for path in paths:
