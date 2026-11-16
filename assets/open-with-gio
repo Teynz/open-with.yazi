@@ -270,6 +270,16 @@ CONFIG_TEMPLATE = """\
 # orphan = true                      # nur bei run: von Yazi abkoppeln
 #
 # Ein Eintrag gilt, wenn mime ODER ext auf alle gewaehlten Dateien passt.
+#
+# System-Apps (aus xdg) im Alt+O-Menue ausblenden:
+#
+# [[hide]]
+# app  = "Firefox"                   # Name wie im Menue oder Desktop-ID
+# mime = "image/*"                   # optional: nur fuer diese Typen
+# ext  = ["svg"]                     # optional: nur fuer diese Endungen
+#
+# Ohne mime/ext wird die App ueberall ausgeblendet. Die xdg-Zuordnung selbst
+# bleibt unveraendert (Dolphin, xdg-open usw. sehen die App weiterhin).
 """
 
 
@@ -307,8 +317,57 @@ def normalize_entry(item: object) -> dict:
     return entry
 
 
-def parse_config(text: str) -> tuple[list[dict], list[str]]:
-    """Return (valid entries, errors).  Raises ValueError on broken TOML."""
+def normalize_hide(item: object) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("kein [[hide]]-Block")
+    app = item.get("app")
+    if not app or not isinstance(app, str):
+        raise ValueError("`app` fehlt")
+    exts = [e.lower().lstrip(".") for e in as_list(item.get("ext"), "ext")]
+    return {"app": app, "mime": as_list(item.get("mime"), "mime"),
+            "ext": [e for e in exts if e]}
+
+
+def hide_matches(hide: dict, path: str, mime: str) -> bool:
+    if not hide["mime"] and not hide["ext"]:
+        return True
+    return entry_matches(hide, path, mime)
+
+
+def visible_apps(apps: list[dict], hides: list[dict], paths: list[str],
+                 mimes: list[str]) -> list[dict]:
+    # `app` may be the desktop id or the name shown in the menu.
+    hidden = {
+        hide["app"].casefold()
+        for hide in hides
+        if all(hide_matches(hide, p, m) for p, m in zip(paths, mimes))
+    }
+    return [
+        app for app in apps
+        if app["id"].casefold() not in hidden
+        and str(app.get("name", "")).casefold() not in hidden
+    ]
+
+
+def parse_section(data: dict, key: str, normalize, label: str,
+                  errors: list[str]) -> list[dict]:
+    raw = data.get(key, [])
+    if not isinstance(raw, list):
+        raise ValueError(f"`{key}` muss aus [[{key}]]-Bloecken bestehen")
+    out = []
+    for index, item in enumerate(raw, 1):
+        try:
+            out.append(normalize(item))
+        except ValueError as exc:
+            errors.append(f"{label} {index}: {exc}")
+    return out
+
+
+def parse_config(text: str) -> tuple[list[dict], list[str], list[dict]]:
+    """Return (openers, errors, hides).  Raises ValueError on broken TOML.
+
+    New config sections: add one parse_section() line here.
+    """
     try:
         import tomllib
     except ImportError as exc:  # Python < 3.11
@@ -318,16 +377,10 @@ def parse_config(text: str) -> tuple[list[dict], list[str]]:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"TOML-Fehler: {exc}") from exc
 
-    raw = data.get("opener", [])
-    if not isinstance(raw, list):
-        raise ValueError("`opener` muss aus [[opener]]-Bloecken bestehen")
-    entries, errors = [], []
-    for index, item in enumerate(raw, 1):
-        try:
-            entries.append(normalize_entry(item))
-        except ValueError as exc:
-            errors.append(f"Eintrag {index}: {exc}")
-    return entries, errors
+    errors: list[str] = []
+    entries = parse_section(data, "opener", normalize_entry, "Eintrag", errors)
+    hides = parse_section(data, "hide", normalize_hide, "hide", errors)
+    return entries, errors, hides
 
 
 def read_text(path: str) -> str | None:
@@ -340,15 +393,15 @@ def read_text(path: str) -> str | None:
         raise ValueError(f"{path}: {exc}") from exc
 
 
-def load_config(path: str | None) -> tuple[list[dict], list[str]]:
+def load_config(path: str | None) -> tuple[list[dict], list[str], list[dict]]:
     """Like parse_config(), but never raises: problems become error strings."""
     if not path:
-        return [], []
+        return [], [], []
     try:
         text = read_text(path)
-        return parse_config(text) if text is not None else ([], [])
+        return parse_config(text) if text is not None else ([], [], [])
     except ValueError as exc:
-        return [], [f"{os.path.basename(path)}: {exc}"]
+        return [], [f"{os.path.basename(path)}: {exc}"], []
 
 
 def entry_matches(entry: dict, path: str, mime: str) -> bool:
@@ -403,7 +456,7 @@ def add_entry(path: str, fields: dict) -> str:
     try:
         new = normalize_entry(fields)
         text = read_text(path)
-        entries, _ = parse_config(text) if text is not None else ([], [])
+        entries = parse_config(text)[0] if text is not None else []
     except ValueError as exc:
         raise HelperError(str(exc)) from exc
 
@@ -496,10 +549,10 @@ def do_list(args: argparse.Namespace) -> dict:
     load_gio()
     path_mimes = [content_type(path) for path in paths]
     mimes, apps = discover(path_mimes)
-    entries, errors = load_config(args.config)
+    entries, errors, hides = load_config(args.config)
     return {
         "mimes": mimes,
-        "apps": apps,
+        "apps": visible_apps(apps, hides, paths, path_mimes),
         "custom": custom_for(entries, paths, path_mimes),
         "ext": extension_of(paths[0]),
         "config_errors": errors,

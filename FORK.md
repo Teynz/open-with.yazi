@@ -66,6 +66,14 @@ block  = false                      # nur bei run
 orphan = true                       # nur bei run
 ```
 
+System-Apps ausblenden (nur im `Alt+O`-Menü, xdg bleibt unverändert):
+
+```toml
+[[hide]]
+app  = "Firefox"      # Name wie im Menü oder Desktop-ID
+mime = "image/*"      # optional, ebenso ext; ohne beides: überall
+```
+
 Fehlerhafte Einträge werden einzeln übersprungen und gemeldet.
 
 ### Aufbau (für spätere Erweiterungen)
