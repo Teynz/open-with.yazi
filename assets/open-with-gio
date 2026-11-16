@@ -10,6 +10,10 @@ external TUI) can reuse this helper unchanged.
   --launch  Launch a desktop application with the files.
   --search  Find installed desktop applications by name.
   --add     Append a custom opener to the config file.
+  --remove  Delete the N-th [[opener]] block (--index) from the config file.
+  --hide    Append a [[hide]] block (system app hidden in the Alt+O menu).
+  --xdg-add / --xdg-remove
+            Change the system-wide XDG association (mimeapps.list) via GIO.
   --edit    Open the config file in $VISUAL/$EDITOR (creates it if missing).
 
 We deliberately launch through GAppInfo instead of parsing the Exec= line
@@ -23,6 +27,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -357,7 +362,9 @@ def parse_section(data: dict, key: str, normalize, label: str,
     out = []
     for index, item in enumerate(raw, 1):
         try:
-            out.append(normalize(item))
+            entry = normalize(item)
+            entry["index"] = index
+            out.append(entry)
         except ValueError as exc:
             errors.append(f"{label} {index}: {exc}")
     return out
@@ -413,7 +420,7 @@ def entry_matches(entry: dict, path: str, mime: str) -> bool:
 
 def public(entry: dict) -> dict:
     """The part of an entry the front end needs to build an opener."""
-    keys = ("name", "app", "run", "block", "orphan")
+    keys = ("name", "app", "run", "block", "orphan", "index")
     return {key: entry[key] for key in keys if key in entry}
 
 
@@ -491,6 +498,147 @@ def add_entry(path: str, fields: dict) -> str:
     return "added"
 
 
+TABLE_HEADER = re.compile(r"^\s*\[")
+OPENER_HEADER = re.compile(r"^\s*\[\[\s*opener\s*\]\]\s*(#.*)?$")
+
+
+def strip_index(items: list[dict]) -> list[dict]:
+    return [{k: v for k, v in item.items() if k != "index"} for item in items]
+
+
+def remove_entry(path: str, index: int) -> str:
+    """Delete the index-th [[opener]] block (1-based).  Returns its name.
+
+    Works on the text so comments and all other blocks stay untouched.  The
+    result is only written if re-parsing it yields exactly the old config
+    minus that one entry; otherwise the user is sent to the editor.
+    """
+    try:
+        text = read_text(path)
+        if text is None:
+            raise ValueError("Config-Datei fehlt")
+        entries, _, hides = parse_config(text)
+    except ValueError as exc:
+        raise HelperError(str(exc)) from exc
+    victim = next((e for e in entries if e["index"] == index), None)
+    if victim is None:
+        raise HelperError(f"Eintrag {index} nicht gefunden")
+
+    lines = text.split("\n")
+    starts = [i for i, line in enumerate(lines) if OPENER_HEADER.match(line)]
+    if index > len(starts):
+        raise HelperError("Eintrag nicht eindeutig, bitte ueber Edit entfernen")
+    begin = starts[index - 1]
+    end = begin + 1
+    while end < len(lines) and not TABLE_HEADER.match(lines[end]):
+        end += 1
+    # Comment lines directly above the next block belong to that block;
+    # comment lines directly above this block (no blank line) belong to it.
+    while end > begin + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+        end -= 1
+    while begin > 0 and lines[begin - 1].lstrip().startswith("#"):
+        begin -= 1
+    before, after = lines[:begin], lines[end:]
+    while before and not before[-1].strip():
+        before.pop()
+    while after and not after[0].strip():
+        after.pop(0)
+    kept = before + ([""] if before and after else []) + after
+    result = "\n".join(kept).rstrip("\n") + "\n"
+
+    try:
+        new_entries, _, new_hides = parse_config(result)
+    except ValueError:
+        new_entries, new_hides = None, None
+    expected = strip_index([e for e in entries if e["index"] != index])
+    if new_entries is None or strip_index(new_entries) != expected \
+            or strip_index(new_hides) != strip_index(hides):
+        raise HelperError("Eintrag nicht sicher entfernbar, bitte ueber Edit entfernen")
+    try:
+        write_atomic(path, result)
+    except OSError as exc:
+        raise HelperError(f"cannot write {path}: {exc}") from exc
+    return victim["name"]
+
+
+def add_hide(path: str, app: str, mime: str | None) -> str:
+    """Append a [[hide]] block.  Returns "added" or "exists"."""
+    try:
+        new = normalize_hide({"app": app, "mime": mime})
+        text = read_text(path)
+        hides = parse_config(text)[2] if text is not None else []
+    except ValueError as exc:
+        raise HelperError(str(exc)) from exc
+    for hide in hides:
+        if hide["app"].casefold() == app.casefold() and not hide["ext"] and (
+            not hide["mime"] or (mime and mime in hide["mime"])
+        ):
+            return "exists"
+    lines = ["", "[[hide]]", f"app = {toml_str(app)}"]
+    if new["mime"]:
+        lines.append(f"mime = {toml_str(new['mime'][0])}")
+    base = text if text is not None else CONFIG_TEMPLATE
+    result = base.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+    try:
+        parse_config(result)
+        write_atomic(path, result)
+    except ValueError as exc:
+        raise HelperError(f"neuer Eintrag ungueltig: {exc}") from exc
+    except OSError as exc:
+        raise HelperError(f"cannot write {path}: {exc}") from exc
+    return "added"
+
+
+# ---------------------------------------------------------------------------
+# System-wide XDG associations (~/.config/mimeapps.list), written by GIO.
+# ---------------------------------------------------------------------------
+
+
+def default_id(mime: str) -> str | None:
+    try:
+        app = Gio.AppInfo.get_default_for_type(mime, False)
+    except Exception:
+        return None
+    return app.get_id() if app is not None else None
+
+
+def xdg_change(app_id: str, mime: str, mode: str) -> str:
+    """mode: "add" (offer app), "default" (make it the default), "remove".
+
+    Returns a status word.  "add" and "remove" keep the effective default
+    stable: GIO alone would silently promote a newly added app when no
+    default is pinned, and would keep a removed app as the default.
+    """
+    try:
+        app = resolve_app(app_id)
+    except Exception:
+        app = None
+    if app is None:
+        raise HelperError(f"application not found: {app_id}")
+    before = default_id(mime)
+    try:
+        if mode == "default":
+            ok = app.set_as_default_for_type(mime)
+        elif mode == "add":
+            ok = app.add_supports_type(mime)
+            if ok is not False and before and before != app.get_id() and default_id(mime) != before:
+                previous = resolve_app(before)
+                if previous is not None:
+                    previous.set_as_default_for_type(mime)
+        else:
+            ok = app.remove_supports_type(mime)
+            if ok is not False and default_id(mime) == app.get_id():
+                others = [a for a in Gio.AppInfo.get_all_for_type(mime) if a.get_id() != app.get_id()]
+                if not others:
+                    return "still-default"
+                others[0].set_as_default_for_type(mime)
+    except GLib.Error as exc:
+        raise HelperError(f"xdg {mode} failed for {app_id}: {exc}") from exc
+    if ok is False:
+        raise HelperError(f"GIO rejected xdg {mode} for {app_id}")
+    return {"add": "added", "default": "default", "remove": "removed"}[mode]
+
+
 def edit_config(path: str) -> None:
     """Replace this process with the user's editor on the config file."""
     if read_text(path) is None:
@@ -528,6 +676,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search", metavar="QUERY", help="find installed apps by name")
     parser.add_argument("--add", action="store_true", help="append a custom opener")
     parser.add_argument("--edit", action="store_true", help="edit the config file")
+    parser.add_argument("--remove", action="store_true", help="delete a custom opener")
+    parser.add_argument("--hide", action="store_true", help="hide a system app in the menu")
+    parser.add_argument("--xdg-add", action="store_true", help="add a system-wide association")
+    parser.add_argument("--xdg-remove", action="store_true", help="remove a system-wide association")
+    parser.add_argument("--default", action="store_true", help="--xdg-add: also make it the default")
+    parser.add_argument("--index", type=int, help="--remove: position of the [[opener]] block")
     parser.add_argument("--config", metavar="FILE", help="custom opener config file")
     parser.add_argument("--app", help="--add: desktop id")
     parser.add_argument("--run", help="--add: shell command instead of --app")
@@ -578,6 +732,32 @@ def do_add(args: argparse.Namespace) -> dict:
     return {"status": add_entry(args.config, fields), "config": args.config}
 
 
+def do_remove(args: argparse.Namespace) -> dict:
+    need(args.config, "--config is required")
+    return {"status": "removed", "name": remove_entry(args.config, need(args.index, "--index is required"))}
+
+
+def do_hide(args: argparse.Namespace) -> dict:
+    need(args.config, "--config is required")
+    mime = args.mime[0] if args.mime else None
+    return {"status": add_hide(args.config, need(args.app, "--app is required"), mime)}
+
+
+def one_mime(args: argparse.Namespace) -> str:
+    return need(args.mime, "--mime is required")[0]
+
+
+def do_xdg_add(args: argparse.Namespace) -> dict:
+    load_gio()
+    mode = "default" if args.default else "add"
+    return {"status": xdg_change(need(args.app, "--app is required"), one_mime(args), mode)}
+
+
+def do_xdg_remove(args: argparse.Namespace) -> dict:
+    load_gio()
+    return {"status": xdg_change(need(args.app, "--app is required"), one_mime(args), "remove")}
+
+
 def do_edit(args: argparse.Namespace) -> dict | None:
     edit_config(need(args.config, "--config is required"))
     return None
@@ -587,6 +767,10 @@ def do_edit(args: argparse.Namespace) -> dict | None:
 ACTIONS = (
     ("launch", do_launch),
     ("search", do_search),
+    ("xdg_add", do_xdg_add),
+    ("xdg_remove", do_xdg_remove),
+    ("remove", do_remove),
+    ("hide", do_hide),
     ("add", do_add),
     ("edit", do_edit),
     ("list", do_list),
@@ -602,7 +786,7 @@ def main() -> int:
                 if payload is not None:
                     emit(payload)
                 return 0
-        emit({"error": "one of --list, --launch, --search, --add or --edit is required"})
+        emit({"error": "no action given (see --help)"})
         return 64
     except HelperError as exc:
         emit({"error": str(exc)})

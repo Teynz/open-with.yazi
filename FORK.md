@@ -49,12 +49,20 @@ Das `Alt+O`-Menü endet mit zwei Einträgen:
 - **`[+] Add opener`**: komplett in Yazi. App wählen (für den Typ bekannte
   Apps als Tastenmenü, `/` sucht per Name), dann Geltung `m` MIME, `e` Endung
   oder `b` beides. Direkt belegbar: `plugin open-with add`.
+  Weitere Wahlmöglichkeiten: `!` nimmt einen eigenen Befehl statt einer App,
+  `x` trägt die App systemweit in xdg ein (`a` zusätzlich, `s` als Standard).
+- **`[-] Remove opener`**: Eintrag wählen. Eigene Opener werden aus der Datei
+  gelöscht; System-Apps werden entweder nur hier ausgeblendet (`h`, schreibt
+  `[[hide]]`) oder systemweit entfernt (`x`, xdg). Direkt belegbar:
+  `plugin open-with remove`.
 - **`[~] Edit openers`**: öffnet `~/.config/yazi/open-with.toml` in
   `$VISUAL`/`$EDITOR`. Reihenfolge im Menü = Reihenfolge in der Datei.
 
 Menü-Reihenfolge: Opener der Yazi-Regel, eigene Opener, System-Apps, Add/Edit.
-`O` und `Enter` bleiben unverändert; `yazi.toml` und `mimeapps.list` werden
-nicht angefasst.
+`O`, `Enter` und `yazi.toml` bleiben unverändert. `~/.config/mimeapps.list`
+wird nur bei den ausdrücklichen `x`-Aktionen geändert, über GIO. Dabei bleibt
+die bisherige Standard-App erhalten: GIO allein würde eine neu hinzugefügte
+App zum Standard machen, wenn keiner festgelegt ist.
 
 ```toml
 [[opener]]
@@ -80,9 +88,9 @@ Fehlerhafte Einträge werden einzeln übersprungen und gemeldet.
 
 | Teil | Aufgabe |
 |---|---|
-| `assets/open-with-gio` | gesamte Logik (GIO, Config lesen/schreiben), gibt JSON aus: `--list`, `--search`, `--add`, `--edit`, `--launch` |
+| `assets/open-with-gio` | gesamte Logik (GIO, Config lesen/schreiben), gibt JSON aus: `--list`, `--search`, `--add`, `--remove`, `--hide`, `--xdg-add`, `--xdg-remove`, `--edit`, `--launch` |
 | `UI.menu` / `UI.ask` / `UI.notify` in `main.lua` | einzige Stelle, die Yazi-Menüs zeichnet |
-| `FLOWS` in `main.lua` | eine Funktion pro Aktion (`open`, `add`) |
+| `FLOWS` in `main.lua` | eine Funktion pro Aktion (`open`, `add`, `remove`) |
 
 Neue Einstellung: in `normalize_entry()` und `public()` (Python) ergänzen und
 in `install()` (Lua) auswerten. Externes TUI: ruft dieselben Helfer-Befehle

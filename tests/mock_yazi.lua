@@ -29,15 +29,15 @@ local function check(c, m) print((c and "PASS " or "FAIL ") .. m); ok = ok and c
 local LIST = function() return { mimes = { "application/pdf" }, ext = "pdf", config_errors = {},
   apps = { { id = "org.kde.okular.desktop", name = "Okular", default = true }, { id = "gimp.desktop", name = "GIMP" },
            { id = "evil;rm.desktop", name = "Evil" } },
-  custom = { { name = "Mein GIMP", app = "gimp.desktop", block = false, orphan = true },
-             { name = "mpv audio", run = "mpv --no-video %s", block = true, orphan = false } } } end
+  custom = { { name = "Mein GIMP", app = "gimp.desktop", block = false, orphan = true, index = 1 },
+             { name = "mpv audio", run = "mpv --no-video %s", block = true, orphan = false, index = 3 } } } end
 
 -- 1) open
 ya.sleep = function() st.snapshot = table.concat(rules[1].use, ",") end
 replies = { LIST() }
 plugin.entry(nil, { args = {} })
-check(st.snapshot == "edit,reveal,openwith_-custom-1,openwith_-custom-2,openwith_org.kde.okular.desktop,openwith_-add,openwith_-edit",
-  "Reihenfolge: Regel, custom, System (ohne Duplikat/unsichere ID), Add, Edit\n     " .. tostring(st.snapshot))
+check(st.snapshot == "edit,reveal,openwith_-custom-1,openwith_-custom-2,openwith_org.kde.okular.desktop,openwith_-add,openwith_-remove,openwith_-edit",
+  "Reihenfolge: Regel, custom, System (ohne Duplikat/unsichere ID), Add, Remove, Edit\n     " .. tostring(st.snapshot))
 check(emitted[1] == "open", "nativer Picker geoeffnet")
 check(table.concat(rules[1].use, ",") == "edit,reveal" and next(opener) == nil, "Cleanup: Regel + Opener wieder sauber")
 check(table.concat(calls[1], " ") == "python3 /cfg/plugins/open-with.yazi/assets/open-with-gio --list --config=/cfg/open-with.toml -- /h/a b.pdf", "Helfer-Aufruf list")
@@ -63,7 +63,7 @@ check(notes[1] == "GIMP hinzugefuegt" and #calls == 3, "add: Meldung + Menue ern
 
 -- 3) add ueber Suche, Scope Endung
 calls = {}; replies = { LIST(), { apps = { { id = "vlc.desktop", name = "VLC" } } }, { status = "exists" }, LIST() }
-whichq = { 4, 1, 2 }; inputq = { "vlc" }
+whichq = { 4, 1, 2 }; inputq = { "vlc" }  -- 4 = "/"
 plugin.entry(nil, { args = { "add" } })
 check(calls[2][3] == "--search=vlc", "add: Suche")
 check(table.concat(calls[3], " "):find("--app=vlc.desktop --name=VLC --ext=pdf", 1, true) ~= nil and not table.concat(calls[3], " "):find("--mime", 1, true), "add: nur Endung")
@@ -78,4 +78,37 @@ hov.cha.is_dir = true; emitted, calls, notes = {}, {}, {}
 plugin.entry(nil, { args = {} }); check(emitted[1] == "open" and #calls == 0, "Ordner: nativer Picker ohne Helfer")
 plugin.entry(nil, { args = { "add" } }); check(#calls == 0 and notes[1]:find("lokale Dateien", 1, true) ~= nil, "Ordner: add meldet Hinweis")
 plugin.entry(nil, { args = { "nope" } }); check(notes[#notes]:find("Unbekannte Aktion", 1, true) ~= nil, "unbekannte Aktion")
+
+-- 6) add systemweit (xdg): als Standard / nur hinzufuegen
+hov.cha.is_dir = false
+local function run(action, which, input, reps)
+  calls, notes = {}, {}; whichq = which; inputq = input or {}; replies = reps
+  plugin.entry(nil, { args = { action } })
+end
+local function line(i) return table.concat(calls[i], " ") end
+run("add", { 1, 4, 2 }, nil, { LIST(), { status = "default" }, LIST() })
+check(line(2):find("--xdg-add --app=org.kde.okular.desktop --mime=application/pdf --default", 1, true) ~= nil, "add x + s: xdg Standard")
+check(whichq.last[1].on == "a" and whichq.last[2].on == "s", "add x: Rollenfrage a/s")
+run("add", { 1, 4, 1 }, nil, { LIST(), { status = "added" }, LIST() })
+check(line(2):find("--xdg-add", 1, true) ~= nil and not line(2):find("--default", 1, true) and not line(2):find("--config", 1, true), "add x + a: ohne --default, ohne Config")
+run("add", { 1, 4 }, nil, { LIST() })
+check(#calls == 1, "add x: Esc bei Rolle bricht ab")
+
+-- 7) eigener Befehl: %s wird ergaenzt, kein x im Scope-Menue
+run("add", { 5, 1 }, { "mpv --no-video", "mpv Audio" }, { LIST(), { status = "added" }, LIST() })
+check(line(2):find("--run=mpv --no-video %s --name=mpv Audio --mime=application/pdf", 1, true) ~= nil and not line(2):find("--app", 1, true), "add !: Befehl + Name")
+run("add", { 5 }, { "mpv --no-video", "mpv Audio" }, { LIST() })
+check(#whichq.last == 3 and whichq.last[3].on == "b", "add !: Scope ohne x")
+
+-- 8) remove: eigener Eintrag (Index aus Datei), ausblenden, xdg
+run("remove", { 2 }, nil, { LIST(), { status = "removed", name = "mpv audio" }, LIST() })
+check(line(2):find("--remove --config=/cfg/open-with.toml --index=3", 1, true) ~= nil and notes[1] == "mpv audio entfernt", "remove: eigener Eintrag per Datei-Index")
+run("remove", { 3, 1 }, nil, { LIST(), { status = "added" }, LIST() })
+check(line(2):find("--hide --config=/cfg/open-with.toml --app=org.kde.okular.desktop --mime=application/pdf", 1, true) ~= nil, "remove: System-App nur hier ausblenden")
+run("remove", { 3, 2 }, nil, { LIST(), { status = "still-default" }, LIST() })
+check(line(2):find("--xdg-remove --app=org.kde.okular.desktop --mime=application/pdf", 1, true) ~= nil and notes[1]:find("bleibt Standard", 1, true) ~= nil, "remove: xdg + Hinweis still-default")
+run("remove", { 5, 2 }, nil, { LIST() })
+check(#calls == 1, "remove: unsichere ID wird nicht angefasst")
+run("remove", {}, nil, { LIST() })
+check(#calls == 1, "remove: Esc bricht ab")
 print(ok and "GESAMT OK" or "GESAMT FEHLER")

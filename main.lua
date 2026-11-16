@@ -13,7 +13,7 @@
 --   * UI.*                  the only place that draws menus/prompts; swap
 --                           these three functions to use another front end
 --   * FLOWS                 one function per action: `plugin open-with`,
---                           `plugin open-with add`; add new actions there
+--                           `... add`, `... remove`; add new actions there
 --
 -- Install this directory as:
 --   ~/.config/yazi/plugins/open-with.yazi
@@ -356,7 +356,7 @@ local cleanup = ya.sync(function(self, gen)
 end)
 
 -- Runs in the sync context.  Registers, in menu order:
---   custom openers (config file) -> system apps (GIO) -> Add / Edit actions
+--   custom openers (config file) -> system apps (GIO) -> Add / Remove / Edit
 -- and appends them to the rules matched in collect().  The rule's own
 -- openers stay first, so plain Enter/`O` behaviour is never changed.
 local install = ya.sync(function(self, state, data, cfg)
@@ -407,6 +407,10 @@ local install = ya.sync(function(self, state, data, cfg)
 	register(PREFIX .. "-add", {
 		run = "ya emit plugin " .. PLUGIN .. " add",
 		desc = "[+] Add opener",
+	})
+	register(PREFIX .. "-remove", {
+		run = "ya emit plugin " .. PLUGIN .. " remove",
+		desc = "[-] Remove opener",
 	})
 	register(PREFIX .. "-edit", {
 		run = string.format("%s %s --edit --config=%s", ya.quote(PYTHON), ya.quote(bin), ya.quote(cfg)),
@@ -490,20 +494,63 @@ local function flow_open()
 	end
 end
 
--- Step 1 of "add": apps known for this type, or search by name.
-local function pick_app(apps)
-	local items = {}
-	for i = 1, math.min(#apps, #KEYS) do
-		items[i] = { desc = apps[i].name }
+-- Shared start of add/remove: selected files + what the helper knows.
+local function gather(what)
+	local ok, state = pcall(collect)
+	if not ok or not state or state.error or state.native then
+		local why = (ok and state and state.error) or "nur fuer lokale Dateien (keine Ordner)"
+		UI.notify(what .. ": " .. tostring(why), "warn")
+		return nil
 	end
+	local cfg = config_path()
+	local data, err = helper({ "--list", "--config=" .. cfg }, paths_of(state))
+	if not data then
+		UI.notify(err, "error")
+		return nil
+	end
+	if not (data.mimes and data.mimes[1]) then
+		UI.notify(what .. ": MIME-Typ unbekannt", "warn")
+		return nil
+	end
+	return data, cfg
+end
+
+local function named(list)
+	local items = {}
+	for i = 1, math.min(#list, #KEYS) do
+		items[i] = { desc = list[i].name }
+	end
+	return items
+end
+
+-- Step 1 of "add": apps known for this type, search by name, or a command.
+-- Returns { id =, name = } for a desktop app or { run =, name = }.
+local function pick_app(apps)
+	local items = named(apps)
 	local shown = #items
 	items[shown + 1] = { key = "/", desc = "Andere App suchen ..." }
+	items[shown + 2] = { key = "!", desc = "Eigener Befehl ..." }
 
 	local idx = UI.menu(items)
 	if not idx then
 		return nil
 	elseif idx <= shown then
 		return apps[idx]
+	end
+
+	if idx == shown + 2 then
+		local run = UI.ask("Befehl (%s = Dateien):")
+		if not run then
+			return nil
+		end
+		if not run:find("%", 1, true) then
+			run = run .. " %s"
+		end
+		local name = UI.ask("Anzeigename:")
+		if not name then
+			return nil
+		end
+		return { run = run, name = name }
 	end
 
 	local query = UI.ask("App-Name (Teil genuegt):")
@@ -520,78 +567,153 @@ local function pick_app(apps)
 		UI.notify('Keine App gefunden fuer "' .. query .. '"', "warn")
 		return nil
 	end
-
-	items = {}
-	for i = 1, math.min(#hits, #KEYS) do
-		items[i] = { desc = hits[i].name }
-	end
-	idx = UI.menu(items)
+	idx = UI.menu(named(hits))
 	return idx and hits[idx] or nil
 end
 
 -- Step 2 of "add": what the new opener applies to.
-local function pick_scope(mime, ext)
-	if not ext or ext == "" then
-		return { mime = mime }
+-- m/e/b -> own config file (Alt+O only); x -> system-wide XDG association,
+-- offered only for desktop apps (XDG cannot store commands or extensions).
+local function pick_scope(mime, ext, allow_xdg)
+	local items, scopes = {}, {}
+	local function option(key, desc, scope)
+		items[#items + 1] = { key = key, desc = desc }
+		scopes[#scopes + 1] = scope
 	end
-	local idx = UI.menu {
-		{ key = "m", desc = "MIME-Typ: " .. tostring(mime) },
-		{ key = "e", desc = "Endung: ." .. ext },
-		{ key = "b", desc = "Beides" },
+	option("m", "MIME-Typ: " .. tostring(mime), { mime = mime })
+	if ext and ext ~= "" then
+		option("e", "Endung: ." .. ext, { ext = ext })
+		option("b", "Beides", { mime = mime, ext = ext })
+	end
+	if allow_xdg then
+		option("x", "Systemweit (xdg): " .. tostring(mime), { xdg = true })
+	end
+	if #items == 1 then
+		return scopes[1]
+	end
+
+	local scope = scopes[UI.menu(items) or 0]
+	if not scope or not scope.xdg then
+		return scope
+	end
+	local role = UI.menu {
+		{ key = "a", desc = 'Zu "Oeffnen mit" hinzufuegen' },
+		{ key = "s", desc = "Als Standard-App setzen" },
 	}
-	if idx == 1 then
-		return { mime = mime }
-	elseif idx == 2 then
-		return { ext = ext }
-	elseif idx == 3 then
-		return { mime = mime, ext = ext }
+	if not role then
+		return nil
 	end
-	return nil
+	return { xdg = true, default = role == 2 }
 end
 
 -- `plugin open-with add`: pick app -> pick scope -> save -> reopen picker.
 local function flow_add()
-	local ok, state = pcall(collect)
-	if not ok or not state or state.error or state.native then
-		local why = (ok and state and state.error) or "nur fuer lokale Dateien (keine Ordner)"
-		return UI.notify("Add opener: " .. tostring(why), "warn")
-	end
-
-	local cfg = config_path()
-	local data, err = helper({ "--list", "--config=" .. cfg }, paths_of(state))
+	local data, cfg = gather("Add opener")
 	if not data then
-		return UI.notify(err, "error")
-	end
-	local mime = data.mimes and data.mimes[1]
-	if not mime then
-		return UI.notify("Add opener: MIME-Typ unbekannt", "warn")
-	end
-
-	local app = pick_app(data.apps or {})
-	if not app or not safe_id(tostring(app.id or "")) then
 		return
 	end
-	local scope = pick_scope(mime, data.ext)
+	local mime = data.mimes[1]
+
+	local app = pick_app(data.apps or {})
+	if not app then
+		return
+	end
+	local is_app = app.run == nil
+	if is_app and not safe_id(tostring(app.id or "")) then
+		return
+	end
+	local scope = pick_scope(mime, data.ext, is_app)
 	if not scope then
 		return
 	end
 
-	local args = { "--add", "--config=" .. cfg, "--app=" .. app.id, "--name=" .. label(app.name) }
-	if scope.mime then
-		args[#args + 1] = "--mime=" .. scope.mime
+	local args
+	if scope.xdg then
+		args = { "--xdg-add", "--app=" .. app.id, "--mime=" .. mime }
+		if scope.default then
+			args[#args + 1] = "--default"
+		end
+	else
+		local what = is_app and ("--app=" .. app.id) or ("--run=" .. app.run)
+		args = { "--add", "--config=" .. cfg, what, "--name=" .. label(app.name) }
+		if scope.mime then
+			args[#args + 1] = "--mime=" .. scope.mime
+		end
+		if scope.ext then
+			args[#args + 1] = "--ext=" .. scope.ext
+		end
 	end
-	if scope.ext then
-		args[#args + 1] = "--ext=" .. scope.ext
-	end
-	local res, add_err = helper(args)
+	local res, err = helper(args)
 	if not res then
-		return UI.notify(add_err, "error")
+		return UI.notify(err, "error")
 	end
 
+	local name = label(app.name)
 	if res.status == "exists" then
-		UI.notify(label(app.name) .. " ist bereits eingetragen")
+		UI.notify(name .. " ist bereits eingetragen")
+	elseif res.status == "default" then
+		UI.notify(name .. " ist jetzt Standard fuer " .. mime .. " (systemweit)")
+	elseif scope.xdg then
+		UI.notify(name .. " systemweit hinzugefuegt fuer " .. mime)
 	else
-		UI.notify(label(app.name) .. " hinzugefuegt")
+		UI.notify(name .. " hinzugefuegt")
+	end
+	return flow_open()
+end
+
+-- `plugin open-with remove`: pick an entry -> delete / hide / xdg-remove.
+local function flow_remove()
+	local data, cfg = gather("Remove opener")
+	if not data then
+		return
+	end
+	local mime = data.mimes[1]
+
+	-- Same order as the menu: custom openers first, then system apps.
+	local list = {}
+	for _, c in ipairs(data.custom or {}) do
+		list[#list + 1] = { name = c.name, index = c.index }
+	end
+	for _, app in ipairs(data.apps or {}) do
+		list[#list + 1] = { name = app.name, id = app.id }
+	end
+	if #list == 0 then
+		return UI.notify("Remove opener: keine eigenen oder System-Eintraege fuer diese Datei")
+	end
+	local target = list[UI.menu(named(list)) or 0]
+	if not target then
+		return
+	end
+
+	local args, done
+	if target.index then
+		args = { "--remove", "--config=" .. cfg, "--index=" .. tostring(target.index) }
+		done = " entfernt"
+	elseif safe_id(tostring(target.id or "")) then
+		local how = UI.menu {
+			{ key = "h", desc = "Nur hier ausblenden (fuer " .. mime .. ")" },
+			{ key = "x", desc = "Systemweit entfernen (xdg)" },
+		}
+		if how == 1 then
+			args = { "--hide", "--config=" .. cfg, "--app=" .. target.id, "--mime=" .. mime }
+			done = " ausgeblendet"
+		elseif how == 2 then
+			args = { "--xdg-remove", "--app=" .. target.id, "--mime=" .. mime }
+			done = " systemweit entfernt fuer " .. mime
+		end
+	end
+	if not args then
+		return
+	end
+
+	local res, err = helper(args)
+	if not res then
+		return UI.notify(err, "error")
+	end
+	if res.status == "still-default" then
+		UI.notify(label(target.name) .. " bleibt Standard: keine andere App fuer " .. mime, "warn")
+	else
+		UI.notify(label(target.name) .. done)
 	end
 	return flow_open()
 end
@@ -600,6 +722,7 @@ end
 local FLOWS = {
 	open = flow_open,
 	add = flow_add,
+	remove = flow_remove,
 }
 
 return {
