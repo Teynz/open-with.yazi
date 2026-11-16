@@ -5,3 +5,9 @@
 on   = "<A-o>"
 run  = "plugin open-with"
 desc = "Oeffnen mit: Yazi-Opener + System-Apps (xdg/GIO)"
+
+# Optional: Add opener direkt, ohne Umweg ueber das Alt+O-Menue.
+[[mgr.prepend_keymap]]
+on   = "<A-a>"
+run  = "plugin open-with add"
+desc = "Add opener fuer die Datei unter dem Cursor"

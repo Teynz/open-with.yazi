@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """GIO/XDG helper for the yazi `open-with` plugin.
 
-The plugin uses this helper for two things:
+All storage and discovery logic lives here; main.lua only draws menus.  Every
+action prints one JSON object on stdout, so another front end (e.g. an
+external TUI) can reuse this helper unchanged.
 
-  --list   Find every desktop application that can open the given files,
-           using the same GIO data Nautilus uses (default, recommended,
-           fallback and all registered apps).  Prints JSON on stdout.
-  --launch Launch one of those applications with the files.
+  --list    Apps that can open the given files: custom openers from the
+            config file (--config) plus every desktop application GIO knows.
+  --launch  Launch a desktop application with the files.
+  --search  Find installed desktop applications by name.
+  --add     Append a custom opener to the config file.
+  --edit    Open the config file in $VISUAL/$EDITOR (creates it if missing).
 
-We deliberately do the launching through GAppInfo instead of parsing the
-Exec= line ourselves: GIO handles Terminal=true, field codes (%f/%F/%u/%U),
-flatpak apps and startup notification for us.
+We deliberately launch through GAppInfo instead of parsing the Exec= line
+ourselves: GIO handles Terminal=true, field codes (%f/%F/%u/%U), flatpak apps
+and startup notification for us.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
+import shlex
 import sys
+import tempfile
 from dataclasses import dataclass
 
 Gio = None
@@ -160,11 +167,10 @@ def apps_for_type(mime: str) -> dict[str, Candidate]:
     return bucket
 
 
-def discover(paths: list[str]) -> tuple[list[str], list[dict]]:
+def discover(path_mimes: list[str]) -> tuple[list[str], list[dict]]:
     mimes: list[str] = []
     seen: set[str] = set()
-    for path in paths:
-        mime = content_type(path)
+    for mime in path_mimes:
         if mime not in seen:
             seen.add(mime)
             mimes.append(mime)
@@ -245,6 +251,216 @@ def launch(app_id: str, paths: list[str]) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Custom openers (config file).  Pure Python, no GIO: testable on its own.
+# To add a setting: accept it in normalize_entry() and emit it in public().
+# ---------------------------------------------------------------------------
+
+CONFIG_TEMPLATE = """\
+# open-with.yazi - eigene Opener, erscheinen nur im Alt+O-Menue.
+# Reihenfolge im Menue = Reihenfolge in dieser Datei.
+#
+# [[opener]]
+# name   = "Okular"                  # Anzeigename
+# app    = "org.kde.okular.desktop"  # Desktop-App (Start ueber GIO) ...
+# run    = 'mpv --no-video %s'       # ... ODER eigener Befehl (%s = Dateien)
+# mime   = "application/pdf"         # MIME-Typ(en), Muster wie "image/*" erlaubt
+# ext    = ["pdf", "tar.gz"]         # und/oder Endung(en), ohne Punkt
+# block  = false                     # nur bei run: im Yazi-Terminal ausfuehren
+# orphan = true                      # nur bei run: von Yazi abkoppeln
+#
+# Ein Eintrag gilt, wenn mime ODER ext auf alle gewaehlten Dateien passt.
+"""
+
+
+def as_list(value: object, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise ValueError(f"`{field}` muss Text oder eine Liste von Texten sein")
+
+
+def normalize_entry(item: object) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("kein [[opener]]-Block")
+    app, run = item.get("app"), item.get("run")
+    if bool(app) == bool(run):
+        raise ValueError("genau eines von `app` oder `run` angeben")
+    if not isinstance(app or run, str):
+        raise ValueError("`app`/`run` muss Text sein")
+    mimes = as_list(item.get("mime"), "mime")
+    exts = [e.lower().lstrip(".") for e in as_list(item.get("ext"), "ext")]
+    if not mimes and not exts:
+        raise ValueError("`mime` oder `ext` fehlt")
+    block = bool(item.get("block", False))
+    entry = {
+        "name": clean(item.get("name")) or clean(app or run),
+        "mime": mimes,
+        "ext": [e for e in exts if e],
+        "block": block,
+        "orphan": bool(item.get("orphan", not block)),
+    }
+    entry["app" if app else "run"] = app or run
+    return entry
+
+
+def parse_config(text: str) -> tuple[list[dict], list[str]]:
+    """Return (valid entries, errors).  Raises ValueError on broken TOML."""
+    try:
+        import tomllib
+    except ImportError as exc:  # Python < 3.11
+        raise ValueError("Python >= 3.11 noetig (tomllib)") from exc
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"TOML-Fehler: {exc}") from exc
+
+    raw = data.get("opener", [])
+    if not isinstance(raw, list):
+        raise ValueError("`opener` muss aus [[opener]]-Bloecken bestehen")
+    entries, errors = [], []
+    for index, item in enumerate(raw, 1):
+        try:
+            entries.append(normalize_entry(item))
+        except ValueError as exc:
+            errors.append(f"Eintrag {index}: {exc}")
+    return entries, errors
+
+
+def read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+
+
+def load_config(path: str | None) -> tuple[list[dict], list[str]]:
+    """Like parse_config(), but never raises: problems become error strings."""
+    if not path:
+        return [], []
+    try:
+        text = read_text(path)
+        return parse_config(text) if text is not None else ([], [])
+    except ValueError as exc:
+        return [], [f"{os.path.basename(path)}: {exc}"]
+
+
+def entry_matches(entry: dict, path: str, mime: str) -> bool:
+    if any(fnmatch.fnmatchcase(mime, pattern) for pattern in entry["mime"]):
+        return True
+    name = os.path.basename(path).lower()
+    return any(name.endswith("." + ext) for ext in entry["ext"])
+
+
+def public(entry: dict) -> dict:
+    """The part of an entry the front end needs to build an opener."""
+    keys = ("name", "app", "run", "block", "orphan")
+    return {key: entry[key] for key in keys if key in entry}
+
+
+def custom_for(entries: list[dict], paths: list[str], mimes: list[str]) -> list[dict]:
+    return [
+        public(entry)
+        for entry in entries
+        if all(entry_matches(entry, p, m) for p, m in zip(paths, mimes))
+    ]
+
+
+def extension_of(path: str) -> str:
+    name = os.path.basename(path)
+    return name.rsplit(".", 1)[1].lower() if "." in name[1:] else ""
+
+
+def write_atomic(path: str, text: str) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".open-with-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def toml_str(value: str) -> str:
+    # A JSON string is a valid TOML basic string.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def add_entry(path: str, fields: dict) -> str:
+    """Append one opener.  Returns "added" or "exists"."""
+    try:
+        new = normalize_entry(fields)
+        text = read_text(path)
+        entries, _ = parse_config(text) if text is not None else ([], [])
+    except ValueError as exc:
+        raise HelperError(str(exc)) from exc
+
+    target = new.get("app") or new.get("run")
+    for entry in entries:
+        if (entry.get("app") or entry.get("run")) == target and all(
+            m in entry["mime"] for m in new["mime"]
+        ) and all(e in entry["ext"] for e in new["ext"]):
+            return "exists"
+
+    lines = ["", "[[opener]]", f"name = {toml_str(new['name'])}"]
+    lines.append(f"{'app' if 'app' in new else 'run'} = {toml_str(target)}")
+    for key in ("mime", "ext"):
+        if len(new[key]) == 1:
+            lines.append(f"{key} = {toml_str(new[key][0])}")
+        elif new[key]:
+            lines.append(f"{key} = [{', '.join(toml_str(v) for v in new[key])}]")
+    if "run" in new:
+        lines.append(f"block = {str(new['block']).lower()}")
+        lines.append(f"orphan = {str(new['orphan']).lower()}")
+
+    base = text if text is not None else CONFIG_TEMPLATE
+    result = base.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+    try:
+        parse_config(result)  # never write a file we could not read back
+    except ValueError as exc:
+        raise HelperError(f"neuer Eintrag ungueltig: {exc}") from exc
+    try:
+        write_atomic(path, result)
+    except OSError as exc:
+        raise HelperError(f"cannot write {path}: {exc}") from exc
+    return "added"
+
+
+def edit_config(path: str) -> None:
+    """Replace this process with the user's editor on the config file."""
+    if read_text(path) is None:
+        write_atomic(path, CONFIG_TEMPLATE)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nvim"
+    argv = shlex.split(editor) + [path]
+    os.execvp(argv[0], argv)
+
+
+def search_apps(query: str, limit: int = 30) -> list[dict]:
+    needle = query.casefold().strip()
+    found = []
+    for app in Gio.AppInfo.get_all():
+        app_id = app.get_id()
+        if not app_id or not app.should_show():
+            continue
+        name = clean(app.get_display_name()) or clean(app.get_name()) or app_id
+        if needle in name.casefold() or needle in app_id.casefold():
+            found.append({"id": app_id, "name": name})
+    found.sort(key=lambda a: (a["name"].casefold(), a["id"].casefold()))
+    return found[:limit]
+
+
 def emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -256,41 +472,91 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="print candidate apps as JSON")
     parser.add_argument("--launch", metavar="DESKTOP_ID", help="launch a desktop application")
+    parser.add_argument("--search", metavar="QUERY", help="find installed apps by name")
+    parser.add_argument("--add", action="store_true", help="append a custom opener")
+    parser.add_argument("--edit", action="store_true", help="edit the config file")
+    parser.add_argument("--config", metavar="FILE", help="custom opener config file")
+    parser.add_argument("--app", help="--add: desktop id")
+    parser.add_argument("--run", help="--add: shell command instead of --app")
+    parser.add_argument("--name", help="--add: display name")
+    parser.add_argument("--mime", action="append", help="--add: MIME pattern")
+    parser.add_argument("--ext", action="append", help="--add: file extension")
     parser.add_argument("paths", nargs="*", help="file paths (use -- before the list)")
     return parser.parse_args()
 
 
+def need(value, message: str):
+    if not value:
+        raise HelperError(message)
+    return value
+
+
+def do_list(args: argparse.Namespace) -> dict:
+    paths = need([p for p in args.paths if p], "no files given")
+    load_gio()
+    path_mimes = [content_type(path) for path in paths]
+    mimes, apps = discover(path_mimes)
+    entries, errors = load_config(args.config)
+    return {
+        "mimes": mimes,
+        "apps": apps,
+        "custom": custom_for(entries, paths, path_mimes),
+        "ext": extension_of(paths[0]),
+        "config_errors": errors,
+    }
+
+
+def do_launch(args: argparse.Namespace) -> dict | None:
+    paths = need([p for p in args.paths if p], "no files given")
+    load_gio()
+    launch(args.launch, paths)
+    return None
+
+
+def do_search(args: argparse.Namespace) -> dict:
+    load_gio()
+    return {"apps": search_apps(args.search)}
+
+
+def do_add(args: argparse.Namespace) -> dict:
+    need(args.config, "--config is required")
+    fields = {"name": args.name, "app": args.app, "run": args.run,
+              "mime": args.mime, "ext": args.ext}
+    return {"status": add_entry(args.config, fields), "config": args.config}
+
+
+def do_edit(args: argparse.Namespace) -> dict | None:
+    edit_config(need(args.config, "--config is required"))
+    return None
+
+
+# First matching action wins.  New actions: add a flag above and a line here.
+ACTIONS = (
+    ("launch", do_launch),
+    ("search", do_search),
+    ("add", do_add),
+    ("edit", do_edit),
+    ("list", do_list),
+)
+
+
 def main() -> int:
     args = parse_args()
-    paths = [path for path in args.paths if path]
-
-    if not paths:
-        emit({"error": "no files given"})
+    try:
+        for flag, action in ACTIONS:
+            if getattr(args, flag) not in (None, False):
+                payload = action(args)
+                if payload is not None:
+                    emit(payload)
+                return 0
+        emit({"error": "one of --list, --launch, --search, --add or --edit is required"})
         return 64
-
-    try:
-        load_gio()
-    except HelperError as exc:
-        emit({"error": str(exc)})
-        return 70
-
-    try:
-        if args.launch:
-            launch(args.launch, paths)
-        elif args.list:
-            mimes, apps = discover(paths)
-            emit({"mimes": mimes, "apps": apps})
-        else:
-            emit({"error": "one of --list or --launch is required"})
-            return 64
     except HelperError as exc:
         emit({"error": str(exc)})
         return 1
     except Exception as exc:  # pragma: no cover - defensive
         emit({"error": f"unexpected error: {exc}"})
         return 1
-
-    return 0
 
 
 if __name__ == "__main__":

@@ -42,13 +42,54 @@ Keine automatischen Updates: Upstream-Änderungen werden nur nach erneuter Prüf
 4. **Beispiel-Keymap auf `<A-o>`** (`examples/keymap.toml`)
    Yazis Standardbelegung `O` bleibt unangetastet.
 
+## Erweiterung: eigene Opener (Branch `tui-editor`)
+
+Das `Alt+O`-Menü endet mit zwei Einträgen:
+
+- **`[+] Add opener`**: komplett in Yazi. App wählen (für den Typ bekannte
+  Apps als Tastenmenü, `/` sucht per Name), dann Geltung `m` MIME, `e` Endung
+  oder `b` beides. Direkt belegbar: `plugin open-with add`.
+- **`[~] Edit openers`**: öffnet `~/.config/yazi/open-with.toml` in
+  `$VISUAL`/`$EDITOR`. Reihenfolge im Menü = Reihenfolge in der Datei.
+
+Menü-Reihenfolge: Opener der Yazi-Regel, eigene Opener, System-Apps, Add/Edit.
+`O` und `Enter` bleiben unverändert; `yazi.toml` und `mimeapps.list` werden
+nicht angefasst.
+
+```toml
+[[opener]]
+name   = "Okular"
+app    = "org.kde.okular.desktop"   # oder: run = 'mpv --no-video %s'
+mime   = "application/pdf"          # Muster wie "image/*" erlaubt
+ext    = ["pdf"]                    # und/oder Endungen
+block  = false                      # nur bei run
+orphan = true                       # nur bei run
+```
+
+Fehlerhafte Einträge werden einzeln übersprungen und gemeldet.
+
+### Aufbau (für spätere Erweiterungen)
+
+| Teil | Aufgabe |
+|---|---|
+| `assets/open-with-gio` | gesamte Logik (GIO, Config lesen/schreiben), gibt JSON aus: `--list`, `--search`, `--add`, `--edit`, `--launch` |
+| `UI.menu` / `UI.ask` / `UI.notify` in `main.lua` | einzige Stelle, die Yazi-Menüs zeichnet |
+| `FLOWS` in `main.lua` | eine Funktion pro Aktion (`open`, `add`) |
+
+Neue Einstellung: in `normalize_entry()` und `public()` (Python) ergänzen und
+in `install()` (Lua) auswerten. Externes TUI: ruft dieselben Helfer-Befehle
+auf, `main.lua` braucht dann nur einen Opener, der es startet.
+
+Tests: `python3 tests/test_config.py` und `lua5.4 tests/mock_yazi.lua main.lua`
+(Yazi-Mock, prüft Abläufe und Reihenfolge, ersetzt keinen Test in Yazi).
+
 ## Installation
 
 Als Drop-in nach `~/.config/yazi/plugins/open-with.yazi/` (Verzeichnisname
 ist Pflicht, der Helfer-Pfad wird daraus gebildet). `install.sh` aus Upstream
 wird nicht verwendet.
 
-Abhängigkeiten (Arch): `python-gobject`, `glib2`, `file`.
+Abhängigkeiten (Arch): `python` (>= 3.11), `python-gobject`, `glib2`, `file`.
 
 ## Bekannte Grenzen (Upstream)
 

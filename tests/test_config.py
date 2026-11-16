@@ -1,0 +1,38 @@
+import importlib.machinery, importlib.util, os, sys, tempfile, tomllib
+H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "open-with-gio")
+loader = importlib.machinery.SourceFileLoader("owg", H)
+spec = importlib.util.spec_from_loader("owg", loader); m = importlib.util.module_from_spec(spec)
+sys.modules["owg"] = m; loader.exec_module(m)
+d = tempfile.mkdtemp(); c = os.path.join(d, "sub", "open-with.toml")
+ok = lambda cond, msg: print(("PASS " if cond else "FAIL ") + msg) or cond
+r = []
+r.append(ok(m.load_config(c) == ([], []), "fehlende Datei -> leer"))
+r.append(ok(m.add_entry(c, {"app": "org.kde.okular.desktop", "name": "Okular", "mime": ["application/pdf"], "ext": ["PDF"]}) == "added", "add both"))
+r.append(ok(m.add_entry(c, {"app": "org.kde.okular.desktop", "name": "Okular", "mime": ["application/pdf"]}) == "exists", "Duplikat erkannt"))
+r.append(ok(m.add_entry(c, {"run": "mpv --no-video %s", "name": 'mpv "audio"', "ext": ["mp3"]}) == "added", "add run mit Anfuehrungszeichen"))
+e, errs = m.load_config(c)
+r.append(ok(len(e) == 2 and not errs, "2 Eintraege lesbar"))
+r.append(ok(e[0]["ext"] == ["pdf"] and e[1]["name"] == 'mpv "audio"' and e[1]["orphan"] is True, "Normalisierung"))
+r.append(ok(open(c).read().startswith("# open-with.yazi"), "Template-Kopf vorhanden"))
+P = ["/x/A.PDF", "/x/b.pdf"]
+r.append(ok([x["name"] for x in m.custom_for(e, P, ["application/pdf"] * 2)] == ["Okular"], "match alle Dateien"))
+r.append(ok(m.custom_for(e, ["/x/a.pdf", "/x/s.mp3"], ["application/pdf", "audio/mpeg"]) == [], "gemischte Auswahl -> nichts"))
+r.append(ok([x["name"] for x in m.custom_for(e, ["/x/unbenannt"], ["application/pdf"])] == ["Okular"], "match nur ueber MIME"))
+r.append(ok("mime" not in m.custom_for(e, P, ["application/pdf"] * 2)[0], "public() ohne Muster"))
+open(c, "a").write('\n[[opener]]\nname = "kaputt"\nmime = "image/*"\n\n[[opener]]\nrun = "gimp %s"\nmime = "image/*"\n')
+e, errs = m.load_config(c)
+r.append(ok(len(e) == 3 and len(errs) == 1 and errs[0].startswith("Eintrag 3"), "kaputter Eintrag isoliert: " + str(errs)))
+r.append(ok(m.custom_for(e, ["/x/a.png"], ["image/png"])[0]["name"] == "gimp %s", "Glob image/* + Name-Fallback"))
+before = open(c).read(); open(c, "a").write("\n[[opener\n")
+e, errs = m.load_config(c)
+r.append(ok(e == [] and len(errs) == 1 and "TOML" in errs[0], "TOML-Fehler gemeldet"))
+try:
+    m.add_entry(c, {"app": "x.desktop", "mime": ["a/b"]}); r.append(ok(False, "add bei kaputter Datei"))
+except m.HelperError: r.append(ok(open(c).read() == before + "\n[[opener\n", "add verweigert, Datei unveraendert"))
+for bad in ({"mime": ["a/b"]}, {"app": "a", "run": "b", "mime": ["a/b"]}, {"app": "a"}):
+    try: m.add_entry(os.path.join(d, "n.toml"), bad); r.append(ok(False, "ungueltig akzeptiert"))
+    except m.HelperError: r.append(ok(not os.path.exists(os.path.join(d, "n.toml")), "ungueltiges add abgelehnt"))
+r.append(ok([m.extension_of(p) for p in ("/a/b.TXT", "/a/.zshrc", "/a/x.tar.gz", "/a/README")] == ["txt", "", "gz", ""], "extension_of"))
+tomllib.loads(m.CONFIG_TEMPLATE); r.append(ok(True, "Template ist gueltiges TOML"))
+r.append(ok(not [f for f in os.listdir(os.path.dirname(c)) if f.endswith(".tmp")], "keine Temp-Reste"))
+print("GESAMT", "OK" if all(r) else "FEHLER", len(r))
